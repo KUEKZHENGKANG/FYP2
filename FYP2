@@ -1,0 +1,763 @@
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
+import sys
+import os
+
+# ==========================================
+# (Global Configuration)
+# ==========================================
+DATASETL1 = "datasetL1.npy"
+DATASETL2 = "datasetL2.npy"
+DATA3 = "datasettest.npy"
+
+models = ["DEEPAE","LSTM","BILSTM","LSTMVAE","EnhancedModel"]
+Type = ["L1","L2","D3","Combine"]
+
+MODEL_NAME = "EnhancedModel"
+TYPE = "D3"#L1/L2/D3/Combine
+os.makedirs("Savemodel", exist_ok=True)
+SAVE_BUNDLE_PATH = f"Savemodel/{MODEL_NAME}{TYPE}.pth"
+#DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cpu")
+print("Device:", DEVICE)
+MODE = "TRAIN" #or train
+
+# Hyperparameter
+HIDDEN_SIZE = 64
+EPOCHS = 200
+N_LAYERS = 1
+Z_DIM = 8
+BATCH_SIZE = 64
+LR = 1e-4  
+PATIANCE = 15 # Early stop after 15 round not improve
+IS_DEEPAE = (MODEL_NAME == "DEEPAE")
+
+
+# ==========================================
+# STEP 2: Load Data
+# ==========================================
+if TYPE == "L1":
+    datasetL1 = np.load(DATASETL1).astype(np.float32)
+    train_pool = datasetL1
+elif TYPE == "L2":
+    datasetL2 = np.load(DATASETL2).astype(np.float32)
+    train_pool = datasetL2
+elif TYPE == "D3":
+    datasetL3 = np.load(DATA3).astype(np.float32)
+    train_pool = datasetL3
+else:
+    data_L1 = np.load(DATASETL1).astype(np.float32)
+    data_L2 = np.load(DATASETL2).astype(np.float32)
+    data_L3 = np.load(DATA3).astype(np.float32) 
+    target_size = len(data_L3) 
+    np.random.seed(42)
+    L1_sample = data_L1[np.random.choice(len(data_L1), target_size, replace=False)]
+    L2_sample = data_L2[np.random.choice(len(data_L2), target_size, replace=False)]
+    L3_sample = data_L3 
+
+if TYPE == "Combine":
+    print(f"-> Balanced Volume: L1={len(L1_sample)}, L2={len(L2_sample)}, L3={len(L3_sample)}")
+else:
+    N, T, D = train_pool.shape
+    if IS_DEEPAE:
+        INPUT_DIM = T * D
+    print(f"[Step 2] Train Data Loaded. Shape: {train_pool.shape} (N, T, D)")
+    
+    
+# ==========================================
+# STEP 3: Split Data
+# ==========================================
+if TYPE == "Combine":
+    train_end = int(0.7 * target_size)
+    val_end   = int(0.85 * target_size)
+
+    # Split L1
+    L1_train = L1_sample[:train_end]
+    L1_val   = L1_sample[train_end:val_end]
+    L1_test  = L1_sample[val_end:]
+
+    # Split L2
+    L2_train = L2_sample[:train_end]
+    L2_val   = L2_sample[train_end:val_end]
+    L2_test  = L2_sample[val_end:]
+
+    # Split L3
+    L3_train = L3_sample[:train_end]
+    L3_val   = L3_sample[train_end:val_end]
+    L3_test  = L3_sample[val_end:]
+
+    print(f"[Step 3] Sub-splits complete. Each domain has Train:{len(L1_train)}, Val:{len(L1_val)}, Test:{len(L1_test)}")
+else:
+    #fixed ramdom seed
+    np.random.seed(42)
+    np.random.shuffle(train_pool)
+
+    train_end = int(0.7 * N)
+    val_end = int(0.85 * N)
+
+    x_train = train_pool[:train_end]
+    x_val = train_pool[train_end:val_end]
+    x_test = train_pool[val_end:]
+    print(f"[Step 3] Split done. "f"Train:{len(x_train)}, "f"Val:{len(x_val)}, "f"Test:{len(x_test)}")
+    
+# ==========================================
+# STEP 4: Normalization Parameters
+# ==========================================
+# Train dataset only(Prevent Data Leaking)
+if TYPE.upper() == "COMBINE":
+    if MODE.upper() == "TRAIN":
+        mean_L1 = L1_train.mean(axis=(0, 1), keepdims=True)
+        std_L1  = L1_train.std(axis=(0, 1), keepdims=True) + 1e-6
+        
+        mean_L2 = L2_train.mean(axis=(0, 1), keepdims=True)
+        std_L2  = L2_train.std(axis=(0, 1), keepdims=True) + 1e-6
+        
+        mean_L3 = L3_train.mean(axis=(0, 1), keepdims=True)
+        std_L3  = L3_train.std(axis=(0, 1), keepdims=True) + 1e-6
+        print("[Step 4] Domain-specific stats calculated successfully.")
+    else:
+        print("[Step 4] TEST mode: Loading bundle to retrieve all stats...")
+        bundle = torch.load(SAVE_BUNDLE_PATH, weights_only=False)
+        mean_L1, std_L1 = bundle["mean_L1"], bundle["std_L1"]
+        mean_L2, std_L2 = bundle["mean_L2"], bundle["std_L2"]
+        mean_L3, std_L3 = bundle["mean_L3"], bundle["std_L3"]
+else:
+    if MODE.upper() == "TRAIN":
+        mean = x_train.mean(axis=(0, 1), keepdims=True)
+        std = x_train.std(axis=(0, 1), keepdims=True) + 1e-6
+        print(f"[Step 4] Stats calculated. Mean shape: {mean.shape}")
+    else:
+        # IF mode == test, load the stats
+        print("[Step 4] TEST mode detected. Loading stats from saved bundle...")
+        bundle = torch.load(SAVE_BUNDLE_PATH, weights_only=False)
+        mean = bundle["mean"]
+        std = bundle["std"]
+# ==========================================
+# STEP 5: Pre-processing 
+# ==========================================
+if TYPE.upper() =="COMBINE":
+    if IS_DEEPAE:
+        L1_train_Z = ((L1_train - mean_L1) / std_L1).reshape(len(L1_train), -1)
+        L1_val_Z   = ((L1_val - mean_L1) / std_L1).reshape(len(L1_val), -1)
+        L1_test_Z  = ((L1_test - mean_L1) / std_L1).reshape(len(L1_test), -1)
+
+        L2_train_Z = ((L2_train - mean_L2) / std_L2).reshape(len(L2_train), -1)
+        L2_val_Z   = ((L2_val - mean_L2) / std_L2).reshape(len(L2_val), -1)
+        L2_test_Z  = ((L2_test - mean_L2) / std_L2).reshape(len(L2_test), -1)
+
+        L3_train_Z = ((L3_train - mean_L3) / std_L3).reshape(len(L3_train), -1)
+        L3_val_Z   = ((L3_val - mean_L3) / std_L3).reshape(len(L3_val), -1)
+        L3_test_Z  = ((L3_test - mean_L3) / std_L3).reshape(len(L3_test), -1)
+    else:
+        L1_train_Z = ((L1_train - mean_L1) / std_L1)
+        L1_val_Z   = ((L1_val   - mean_L1) / std_L1)
+        L1_test_Z  = ((L1_test  - mean_L1) / std_L1)
+
+        L2_train_Z = ((L2_train - mean_L2) / std_L2)
+        L2_val_Z   = ((L2_val   - mean_L2) / std_L2)
+        L2_test_Z  = ((L2_test  - mean_L2) / std_L2)
+
+        L3_train_Z = ((L3_train - mean_L3) / std_L3)
+        L3_val_Z   = ((L3_val   - mean_L3) / std_L3)
+        L3_test_Z  = ((L3_test  - mean_L3) / std_L3)
+
+    # Combine both L1 L2 L3
+    x_train_proc = np.concatenate([L1_train_Z, L2_train_Z, L3_train_Z], axis=0)
+    x_val_proc   = np.concatenate([L1_val_Z, L2_val_Z, L3_val_Z], axis=0)
+    x_test_proc  = np.concatenate([L1_test_Z, L2_test_Z, L3_test_Z], axis=0)
+    
+    # shuffle the dataset
+    np.random.shuffle(x_train_proc)
+    np.random.shuffle(x_val_proc)
+
+    if IS_DEEPAE:
+        # update input dim
+        INPUT_DIM = x_train_proc.shape[1]
+    else:   
+        N, T, D = x_train_proc.shape
+
+    print(f"[Step 5] Fusion Complete.")
+    print(f"-> Final Train Pool: {x_train_proc.shape}")
+    print(f"-> Final Val Pool:   {x_val_proc.shape}")
+    print(f"-> Final Test Pool:  {x_test_proc.shape}")
+else:
+    def preprocess(data):
+        z = (data - mean) / std
+        if IS_DEEPAE:
+            return z.reshape(len(data), -1)
+        else:
+            return z
+
+    x_train_proc = preprocess(x_train)
+    x_val_proc = preprocess(x_val)
+    x_test_proc = preprocess(x_test)
+    print(f"[Step 5] Pre-processing complete. Model Input Dim: {x_train_proc.shape[1]}")
+    
+# ==========================================
+# STEP 6: DataLoader
+# ==========================================
+def make_loader(data, batch_size=64, shuffle=False):
+    tensor_data = torch.tensor(data, dtype=torch.float32)
+    return DataLoader(TensorDataset(tensor_data),batch_size=batch_size,shuffle=shuffle,pin_memory=torch.cuda.is_available())
+
+train_loader = make_loader(x_train_proc, shuffle=True)
+train_loader_eval = make_loader(x_train_proc,shuffle=False)
+val_loader = make_loader(x_val_proc)
+test_loader = make_loader(x_test_proc)
+
+
+# ==========================================
+# STEP 7: Architecture
+# ==========================================
+if MODEL_NAME == "DEEPAE":
+    class DenseAE(nn.Module):
+        def __init__(self, input_dim):
+            super().__init__()
+            self.encoder = nn.Sequential(
+                nn.Linear(input_dim, 128), nn.ReLU(),
+                nn.Linear(128, 64), nn.ReLU(),
+                nn.Linear(64, 32)
+            )
+            self.decoder = nn.Sequential(
+                nn.Linear(32, 64), nn.ReLU(),
+                nn.Linear(64, 128), nn.ReLU(),
+                nn.Linear(128, input_dim)
+            )
+
+        def forward(self, x):
+            z = self.encoder(x)
+            out = self.decoder(z)
+            return out, z
+    model = DenseAE(INPUT_DIM).to(DEVICE)
+      
+elif MODEL_NAME =="LSTM":
+    class LSTMAE(nn.Module):
+        def __init__(self, n_features, hidden_size):
+            super().__init__()
+            self.encoder = nn.LSTM(input_size=n_features, hidden_size=hidden_size, batch_first=True)
+            self.decoder = nn.LSTM(input_size=n_features, hidden_size=hidden_size, batch_first=True)
+            self.output_layer = nn.Linear(hidden_size, n_features)
+
+        def forward(self, x, target=None, teacher_forcing_ratio=0.5):
+            # x: (Batch, T, D)
+            _, (h, c) = self.encoder(x)
+
+            
+            dec_input = x[:, 0:1, :] 
+            outputs = []
+
+            for t in range(x.size(1)):
+                out, (h, c) = self.decoder(dec_input, (h, c))
+                out = self.output_layer(out)
+                outputs.append(out)
+                
+                # Teacher Forcing (yes or not)
+                if target is not None and np.random.random() < teacher_forcing_ratio: 
+                    # The last step no need prepare the next input
+                    if t < x.size(1) - 1:
+                        dec_input = target[:, t+1:t+2, :] # take the "real position" of next step
+                else:
+                    dec_input = out # use its own prediction
+
+            return torch.cat(outputs, dim=1)
+
+    model = LSTMAE(D, HIDDEN_SIZE).to(DEVICE)
+        
+elif MODEL_NAME =="BILSTM":
+    class BiEncoder(nn.Module):
+        def __init__(self, n_features, hidden_size, n_layers):
+            super().__init__()
+            self.lstm = nn.LSTM(n_features, hidden_size, n_layers, batch_first=True, bidirectional=True)
+            self.fc = nn.Linear(hidden_size * 2, hidden_size)
+
+        def forward(self, x):
+            _, (h, c) = self.lstm(x)
+            h = torch.cat([h[0], h[1]], dim=1)
+            c = torch.cat([c[0], c[1]], dim=1)
+            h = self.fc(h).unsqueeze(0)
+            c = self.fc(c).unsqueeze(0)
+            return h, c
+
+    class Decoder(nn.Module):
+        def __init__(self, n_features, hidden_size, n_layers):
+            super().__init__()
+            self.lstm = nn.LSTM(n_features, hidden_size, n_layers, batch_first=True)
+            self.fc = nn.Linear(hidden_size, n_features)
+
+        def forward(self, x, h, c):
+            out, (h, c) = self.lstm(x, (h, c))
+            out = self.fc(out)
+            return out, h, c
+
+    class BiLSTMAE(nn.Module):
+        def __init__(self, n_features, hidden_size, n_layers):
+            super().__init__()
+            self.encoder = BiEncoder(n_features, hidden_size, n_layers)
+            self.decoder = Decoder(n_features, hidden_size, n_layers)
+
+        def forward(self, x, target=None, teacher_forcing_ratio=0.5):
+            h, c = self.encoder(x)
+            
+            dec_input = x[:, 0:1, :] 
+            outputs = []
+            T = x.size(1)
+            
+            for t in range(T):
+                out, h, c = self.decoder(dec_input, h, c)
+                outputs.append(out)
+                
+                if target is not None and np.random.random() < teacher_forcing_ratio:
+                    if t < T - 1: 
+                        dec_input = target[:, t+1:t+2, :] 
+                else:
+                    dec_input = out 
+            
+            recon = torch.cat(outputs, dim=1) 
+            return recon
+
+    model = BiLSTMAE(D, HIDDEN_SIZE, N_LAYERS).to(DEVICE)
+    
+elif MODEL_NAME =="LSTMVAE":
+    EPOCHS = 400
+    BATCH_SIZE = 128
+    LR = 5e-4  
+    class LSTMVAE(nn.Module):
+        def __init__(self, input_dim, hidden_size, z_dim):
+            super().__init__()
+
+            # Encoder
+            self.encoder_lstm = nn.LSTM(
+                input_dim,
+                hidden_size,
+                batch_first=True
+            )
+
+            self.fc_mu = nn.Linear(hidden_size, z_dim)
+            self.fc_logvar = nn.Linear(hidden_size, z_dim)
+
+            # Decoder
+            self.decoder_lstm = nn.LSTM(
+                z_dim,
+                hidden_size,
+                batch_first=True
+            )
+
+            self.fc_out = nn.Linear(
+                hidden_size,
+                input_dim
+            )
+
+        def reparameterize(self, mu, logvar):
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            return mu + eps * std
+
+        def forward(self, x):
+
+            enc_out, _ = self.encoder_lstm(x)
+            
+            # (B,T,H) -> (B,T,Z)
+            mu = self.fc_mu(enc_out)
+            # (B,T,H) -> (B,T,Z)
+            logvar = self.fc_logvar(enc_out)
+            # (B,T,Z)
+            z = self.reparameterize(mu, logvar)
+            # Decoder
+            dec_out, _ = self.decoder_lstm(z)
+            # (B,T,H) -> (B,T,D)
+            recon = self.fc_out(dec_out)
+            
+            return recon, mu, logvar
+    model = LSTMVAE(D,HIDDEN_SIZE,Z_DIM).to(DEVICE)
+
+elif MODEL_NAME == "EnhancedModel":
+    class EnhanceBiEncoder(nn.Module):
+        def __init__(self, n_features, hidden_size, n_layers):
+            super().__init__()
+            self.lstm = nn.LSTM(n_features, hidden_size, n_layers, batch_first=True, bidirectional=True)
+            self.fc = nn.Linear(hidden_size * 2, hidden_size)
+
+        def forward(self, x):
+            _, (h, c) = self.lstm(x)
+            h = torch.cat([h[0], h[1]], dim=1)
+            c = torch.cat([c[0], c[1]], dim=1)
+            h = self.fc(h).unsqueeze(0)
+            c = self.fc(c).unsqueeze(0)
+            return h, c
+
+    class Decoder(nn.Module):
+        def __init__(self, n_features, hidden_size, n_layers):
+            super().__init__()
+            self.lstm = nn.LSTM(n_features, hidden_size, n_layers, batch_first=True)
+            self.fc = nn.Linear(hidden_size, n_features)
+
+        def forward(self, x, h, c):
+            out, (h, c) = self.lstm(x, (h, c))
+            out = self.fc(out)
+            return out, h, c
+
+    class EnhanceBiLSTMAE(nn.Module):
+        def __init__(self, n_features, hidden_size, n_layers):
+            super().__init__()
+            self.encoder = EnhanceBiEncoder(n_features, hidden_size, n_layers)
+            self.decoder = Decoder(n_features, hidden_size, n_layers)
+
+        def forward(self, x, target=None, teacher_forcing_ratio=0.5):
+            h, c = self.encoder(x)
+            
+            dec_input = x[:, 0:1, :] 
+            outputs = []
+            T = x.size(1)
+            
+            for t in range(T):
+                out, h, c = self.decoder(dec_input, h, c)
+                outputs.append(out)
+                
+                if target is not None and np.random.random() < teacher_forcing_ratio:
+                    if t < T - 1:
+                        dec_input = target[:, t+1:t+2, :] 
+                else:
+                    dec_input = out 
+
+            recon = torch.cat(outputs, dim=1) 
+            return recon
+
+    model = EnhanceBiLSTMAE(D, HIDDEN_SIZE, N_LAYERS).to(DEVICE)
+    
+else:
+    print("Wrong Model Name!")
+    sys.exit(1)
+    
+# ==========================================
+# STEP 8: Training Configuration
+# ==========================================
+train_losses = []
+val_losses = []
+if MODE.upper() == "TRAIN":
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    patience_counter = 0
+    best_val_loss = float('inf')
+    criterion = nn.MSELoss()
+    
+    if MODEL_NAME.upper() == "LSTMVAE":
+        def vae_loss_func(recon,target,mu,logvar,kl_weight=1.0):
+
+            recon_loss = torch.mean((recon - target) ** 2)
+            kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+            total_loss = recon_loss + kl_weight * kl_loss
+
+            return total_loss, recon_loss, kl_loss
+
+    # ==========================================
+    # STEP 9: Training & Validation
+    # ==========================================
+    print(f"\n[Step 9] Starting Training {MODEL_NAME} Training on {DEVICE}...")
+    for epoch in range(EPOCHS):
+        current_epoch = epoch + 1
+        model.train()
+        total_train_loss = 0
+        if current_epoch <= 20:# Calculate Teacher Forcing Ratio
+            current_ratio = 0.5  # first 20 time tearcher forcing 50%
+        elif current_epoch < 50:
+            # from 21 time untill 49 time, the ratio decresing until 0
+            current_ratio = 0.5 * (1.0 - (current_epoch - 20) / 30)
+        else:
+            current_ratio = 0.0  # after 50 times, turn off tearcher forcing
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:02d}/{EPOCHS}") 
+        
+        if MODEL_NAME.upper() == "LSTMVAE":
+            for (batch,) in train_pbar:
+                batch = batch.to(DEVICE)
+                recon, mu, logvar = model(batch)
+                loss, r_loss, k_loss = vae_loss_func(recon, batch, mu, logvar)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                
+                total_train_loss += loss.item()
+                if train_pbar.n % 100 == 0:
+                    train_pbar.set_postfix(loss=f"{loss.item():.4f}", KL=f"{k_loss.item():.4f}")
+                
+            model.eval()
+            total_val_loss = 0
+            with torch.no_grad():
+                for (v_batch,) in val_loader:
+                    v_batch = v_batch.to(DEVICE)
+                    v_recon, v_mu, v_logvar = model(v_batch)
+                    v_loss, _, _ = vae_loss_func(v_recon, v_batch, v_mu, v_logvar)
+                    total_val_loss += v_loss.item()     
+            avg_train = total_train_loss / len(train_loader)
+            avg_val = total_val_loss / len(val_loader)
+
+            train_losses.append(avg_train)
+            val_losses.append(avg_val)     
+                
+        elif MODEL_NAME.upper() == "DEEPAE":
+            for (batch,) in train_pbar:
+                batch = batch.to(DEVICE)
+                recon, _ = model(batch)
+                loss = criterion(recon, batch)
+                optimizer.zero_grad(); loss.backward(); optimizer.step()
+                total_train_loss += loss.item()
+                if train_pbar.n % 100 == 0:
+                    train_pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+            model.eval()
+            total_val_loss = 0
+            with torch.no_grad():
+                for (v_batch,) in val_loader:
+                    v_batch = v_batch.to(DEVICE)
+                    v_recon, _ = model(v_batch)
+                    total_val_loss += criterion(v_recon, v_batch).item()
+                    
+            avg_train = total_train_loss / len(train_loader)
+            avg_val = total_val_loss / len(val_loader)
+
+            train_losses.append(avg_train)
+            val_losses.append(avg_val)
+            
+        elif MODEL_NAME.upper() == "LSTM":  
+            for (batch,) in train_pbar:
+                batch = batch.to(DEVICE)           
+                # feed the current_ratio 
+                recon = model(batch, target=batch, teacher_forcing_ratio=current_ratio)
+                loss = criterion(recon, batch)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                
+                total_train_loss += loss.item()
+                if train_pbar.n % 100 == 0:
+                    train_pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+            model.eval()
+            total_val_loss = 0
+            with torch.no_grad():
+                for (v_batch,) in val_loader:
+                    v_batch = v_batch.to(DEVICE)
+                    v_recon = model(v_batch) # turn off Teacher Forcing while validation to know the true performance of model
+                    total_val_loss += criterion(v_recon, v_batch).item()
+                    
+            avg_train = total_train_loss / len(train_loader)
+            avg_val = total_val_loss / len(val_loader)
+
+            train_losses.append(avg_train)
+            val_losses.append(avg_val)
+            
+        elif MODEL_NAME.upper() == "BILSTM":
+            for (batch,) in train_pbar:
+                batch = batch.to(DEVICE)
+                recon = model(batch, target=batch, teacher_forcing_ratio=current_ratio)
+                loss = criterion(recon, batch)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                
+                total_train_loss += loss.item()
+                if train_pbar.n % 100 == 0:
+                    train_pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+            model.eval()
+            total_val_loss = 0
+            with torch.no_grad():
+                for (v_batch,) in val_loader:
+                    v_batch = v_batch.to(DEVICE)
+                    v_recon = model(v_batch)
+                    total_val_loss += criterion(v_recon, v_batch).item()
+            avg_train = total_train_loss / len(train_loader)
+            avg_val = total_val_loss / len(val_loader)
+
+            train_losses.append(avg_train)
+            val_losses.append(avg_val)   
+            
+        elif MODEL_NAME.upper() == "ENHANCEDMODEL":
+            for (batch,) in train_pbar:
+                batch = batch.to(DEVICE)
+                recon = model(batch,target=batch,teacher_forcing_ratio=current_ratio)
+                
+                recon_loss = criterion(recon,batch)
+
+                # Smoothness Loss
+                real_motion = (batch[:,1:,:]-batch[:,:-1,:])
+                recon_motion = (recon[:,1:,:]-recon[:,:-1,:])
+
+                smooth_loss = torch.mean((real_motion - recon_motion) ** 2)
+
+                
+                # Total Loss
+                loss = (recon_loss+0.5 * smooth_loss)
+
+                optimizer.zero_grad()
+                loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(),max_norm=1.0)
+                optimizer.step()
+                total_train_loss += loss.item()
+
+
+                if train_pbar.n % 100 == 0:
+                    train_pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+            model.eval()
+            total_val_loss = 0
+            with torch.no_grad():
+                for (v_batch,) in val_loader:
+                    v_batch = v_batch.to(DEVICE)
+                    v_recon = model(v_batch)
+                    recon_loss = criterion(v_recon,v_batch)
+                    
+                    real_motion = (v_batch[:,1:,:]-v_batch[:,:-1,:])
+                    recon_motion = (v_recon[:,1:,:]-v_recon[:,:-1,:])
+
+                    smooth_loss = torch.mean((real_motion - recon_motion) ** 2)
+                    val_loss = (recon_loss+0.5 * smooth_loss)
+
+                    total_val_loss += val_loss.item()
+                    
+            avg_train = total_train_loss / len(train_loader)
+            avg_val = total_val_loss / len(val_loader)
+
+            train_losses.append(avg_train)
+            val_losses.append(avg_val)
+            
+        else:
+            print("Name Error")
+            
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            bundle = {
+                "model_state": model.state_dict(),
+                "train_losses": train_losses,
+                "val_losses": val_losses,
+                "best_val_mse": best_val_loss
+            }
+            if TYPE == "Combine":
+                bundle.update({
+                    "mean_L1": mean_L1,
+                    "std_L1": std_L1,
+                    "mean_L2": mean_L2,
+                    "std_L2": std_L2,
+                    "mean_L3": mean_L3,
+                    "std_L3": std_L3
+                })
+            else:
+                bundle.update({
+                    "mean": mean,
+                    "std": std
+                })
+                                
+            if MODEL_NAME.upper() == "LSTMVAE":
+                bundle.update({
+                    "T": T, 
+                    "D": D, 
+                    "hidden_size": HIDDEN_SIZE, 
+                    "z_dim": Z_DIM})
+            elif MODEL_NAME.upper() == "DEEPAE":
+                bundle.update({"input_dim": INPUT_DIM})   
+            elif MODEL_NAME.upper() == "LSTM":
+                bundle.update({
+                    "T": T, 
+                    "D": D, 
+                    "hidden_size": HIDDEN_SIZE})
+            elif MODEL_NAME.upper() == "BILSTM":
+                bundle.update({
+                    "T": T, 
+                    "D": D,
+                    "hidden_size": HIDDEN_SIZE, 
+                    "n_layers": N_LAYERS
+                    })  
+            else:
+                bundle.update({
+                    "T": T, 
+                    "D": D,
+                    "hidden_size": HIDDEN_SIZE, 
+                    "n_layers": N_LAYERS
+                    })
+            
+            torch.save(bundle, SAVE_BUNDLE_PATH)
+            patience_counter = 0 
+            status = " [★ Best Saved]"
+        else:
+            patience_counter += 1
+            status = f" [No Improvement: {patience_counter}/{PATIANCE}]"
+
+        print(f"Epoch {epoch+1:02d}: Train MSE: {avg_train:.6f} | Val MSE: {avg_val:.6f}{status}")
+
+        if patience_counter >= PATIANCE:
+            if current_epoch < 50:
+                print(f"\n[Warning] Although no improvement was observed after {PATIANCE} epochs,the model may still have been in the early training (warm-up) phase, as convergence had not yet been achieved within the first 50 epochs.")
+                patience_counter = 0 # For first 50 epoch that occur early stop, reset the counter
+            else:
+                print(f"\n[Early Stop] Early Stop when epoch {current_epoch} ")
+                break
+else:
+    print("\n[Skip] Skip the Training, Entering Testing Mode...")
+            
+            
+IS_DEEPAE = (MODEL_NAME == "DEEPAE")
+ERROR_AXIS = 1 if IS_DEEPAE else (1,2)
+
+# ======================================================
+# STEP 10: Performance Evaluation(Using the Best model)
+# ======================================================
+print("\n[Step 10] Final Testing ...")
+bundle = torch.load(SAVE_BUNDLE_PATH, weights_only=False)#Load Best Model
+model.load_state_dict(bundle["model_state"])
+model.eval()
+
+with torch.no_grad():
+    recon_test_list = []
+    for (t_batch,) in tqdm(test_loader, desc="Testing"):
+        t_batch = t_batch.to(DEVICE)
+        if IS_DEEPAE:
+            t_recon, _ = model(t_batch)
+        else:
+            t_recon = model(t_batch)
+            
+        if MODEL_NAME.upper() == "LSTMVAE":
+            t_recon, _, _ = model(t_batch)
+            
+        recon_test_list.append(t_recon.cpu())
+    
+    recon_test = torch.cat(recon_test_list, dim=0).numpy()
+    # Calculate MSE
+    re_test = np.mean((x_test_proc - recon_test) ** 2, axis=ERROR_AXIS)
+    mse = np.mean(re_test) 
+    rmse = np.sqrt(mse)
+    mae = np.mean(np.abs(x_test_proc - recon_test))
+
+print(f"Final Z-Space Results -> MSE: {mse:.6f} | RMSE: {rmse:.6f} | MAE: {mae:.6f}")
+
+# ==========================================
+# STEP 11: Threshold Detection (95%)
+# ==========================================
+with torch.no_grad():
+    recon_train_list = []
+    for (tr_batch,) in tqdm(train_loader_eval, desc="Calculating Threshold"):
+        tr_batch = tr_batch.to(DEVICE)
+        if IS_DEEPAE:
+            tr_recon, _ = model(tr_batch)
+        else:
+            tr_recon = model(tr_batch)
+            
+        if MODEL_NAME == "LSTMVAE":
+            tr_recon, _, _ = model(tr_batch)
+            
+        recon_train_list.append(tr_recon.cpu())
+    
+    recon_train = torch.cat(recon_train_list, dim=0).numpy()
+    
+    re_train = np.mean((x_train_proc - recon_train) ** 2, axis=ERROR_AXIS)
+    threshold = np.percentile(re_train, 95)
+
+print(f"[Step 11] Final Anomaly Threshold (95%): {threshold:.6f}")
+
